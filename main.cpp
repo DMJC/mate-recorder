@@ -57,8 +57,9 @@ protected:
     void on_button_stop();
     void on_button_record();
     
-	bool on_waveform_draw(const Cairo::RefPtr<Cairo::Context>& cr);
+    bool on_waveform_draw(const Cairo::RefPtr<Cairo::Context>& cr);
     bool update_position();
+    void on_position_scale_changed();
     
     static int paCallback(const void *inputBuffer, void *outputBuffer,
                          unsigned long framesPerBuffer,
@@ -110,7 +111,8 @@ private:
     
     PaStream *m_Stream;
     sigc::connection m_TimerConnection;
-    
+    bool m_UpdatingPositionScale;
+        
     void init_audio();
     void cleanup_audio();
     void load_audio_file(const std::string& filename);
@@ -135,7 +137,8 @@ AudioApp::AudioApp()
       m_IsRecording(false),
       m_SampleRate(44100),
       m_Channels(2),
-      m_Stream(nullptr)
+      m_Stream(nullptr),
+      m_UpdatingPositionScale(false)
 {
     set_title("Sound - Sound Recorder");
     set_default_size(400, 200);
@@ -312,8 +315,15 @@ AudioApp::AudioApp()
 	m_PositionScale->set_draw_value(false);
 	m_PositionScale->set_hexpand(true);
 	m_PositionScale->set_vexpand(false);
-
+	m_PositionScale->signal_value_changed().connect(sigc::mem_fun(*this, &AudioApp::on_position_scale_changed));
+	
 	// --- Controls row ---
+	m_ButtonRewind.signal_clicked().connect(sigc::mem_fun(*this, &AudioApp::on_button_rewind));
+	m_ButtonFastForward.signal_clicked().connect(sigc::mem_fun(*this, &AudioApp::on_button_fast_forward));
+	m_ButtonPlay.signal_clicked().connect(sigc::mem_fun(*this, &AudioApp::on_button_play));
+	m_ButtonStop.signal_clicked().connect(sigc::mem_fun(*this, &AudioApp::on_button_stop));
+	m_ButtonRecord.signal_clicked().connect(sigc::mem_fun(*this, &AudioApp::on_button_record));
+
  	m_ControlBox.pack_start(m_ButtonRewind, true, true, 0);
 	m_ControlBox.pack_start(m_ButtonFastForward, true, true, 0);
 	m_ControlBox.pack_start(m_ButtonPlay, true, true, 0);
@@ -454,17 +464,43 @@ void AudioApp::draw_waveform(const Cairo::RefPtr<Cairo::Context>& cr) {
 }
 
 bool AudioApp::update_position() {
+    if (m_IsPlaying) {
+        m_CurrentPosition = std::min(m_PlaybackPosition, m_AudioBuffer.size());
+    } else if (m_IsRecording) {
+        m_CurrentPosition = m_AudioBuffer.size();
+    }
+
     update_displays();
     m_WaveformArea.queue_draw();
     return true;
 }
 
+void AudioApp::on_position_scale_changed() {
+    if (m_UpdatingPositionScale) {
+        return;
+    }
+
+    const double positionSeconds = m_PositionScale->get_value();
+    size_t newPosition = static_cast<size_t>(positionSeconds * m_SampleRate * m_Channels);
+    newPosition = std::min(newPosition, m_AudioBuffer.size());
+
+    m_CurrentPosition = newPosition;
+    m_PlaybackPosition = newPosition;
+    update_displays();
+}
+
 void AudioApp::update_displays() {
-    double posSeconds = (double)m_PlaybackPosition / (m_SampleRate * m_Channels);
-    double lenSeconds = (double)m_AudioBuffer.size() / (m_SampleRate * m_Channels);
-    
+    const double totalSamplesPerSecond = m_SampleRate * m_Channels;
+    double posSeconds = totalSamplesPerSecond > 0 ? (double)m_CurrentPosition / totalSamplesPerSecond : 0.0;
+    double lenSeconds = totalSamplesPerSecond > 0 ? (double)m_AudioBuffer.size() / totalSamplesPerSecond : 0.0;
+
     m_PositionLabel.set_text(format_time(posSeconds));
     m_LengthLabel.set_text(format_time(lenSeconds));
+
+    m_UpdatingPositionScale = true;
+    m_PositionScale->set_range(0.0, std::max(lenSeconds, 0.01));
+    m_PositionScale->set_value(std::min(posSeconds, lenSeconds));
+    m_UpdatingPositionScale = false;
 }
 
 std::string AudioApp::format_time(double seconds) {
@@ -692,7 +728,7 @@ void AudioApp::on_button_fast_forward() {
 
 void AudioApp::on_button_play() {
     if (m_AudioBuffer.empty()) return;
-    
+    m_PlaybackPosition = std::min(m_CurrentPosition, m_AudioBuffer.size());
     m_IsPlaying = true;
     m_IsRecording = false;
     
@@ -708,19 +744,23 @@ void AudioApp::on_button_play() {
 void AudioApp::on_button_stop() {
     m_IsPlaying = false;
     m_IsRecording = false;
-    
+    m_CurrentPosition = std::min(m_PlaybackPosition, m_AudioBuffer.size());
     if (m_Stream) {
         Pa_StopStream(m_Stream);
         Pa_CloseStream(m_Stream);
         m_Stream = nullptr;
     }
+    update_displays();
 }
 
 void AudioApp::on_button_record() {
     m_IsRecording = true;
     m_IsPlaying = false;
     m_AudioBuffer.clear();
-    
+    m_CurrentPosition = 0;
+    m_PlaybackPosition = 0;
+    update_displays();
+
     if (!m_Stream) {
         PaError err = Pa_OpenDefaultStream(&m_Stream, m_Channels, 0, paFloat32,
                                           m_SampleRate, 256, paCallback, this);
